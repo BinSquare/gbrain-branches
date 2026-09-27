@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# gbrain-branch: speculative memory for GBrain.
+#
+# Branch a live brain, let an agent explore in each branch, then merge the
+# branch that earned it back into the brain. A branch is the whole running
+# machine the brain lives in (memory index, markdown repo, processes), copied
+# copy-on-write by smolmachines in under a second, so a branch can never touch
+# the brain it came from until you merge it.
+#
+#   gbrain-branch init    <brain>                 build a branchable brain machine
+#   gbrain-branch fork    <brain> <branch>...     branch the live brain
+#   gbrain-branch exec    <branch> -- <cmd>...    run a command (e.g. gbrain) in a branch
+#   gbrain-branch write   <branch> <slug> < page  save a page into a branch and index it
+#   gbrain-branch diff    <branch>                pages the branch learned since it forked
+#   gbrain-branch merge   <branch>                merge the branch's memory into its brain
+#   gbrain-branch discard <branch>...             throw branches away
+#   gbrain-branch checkpoint <brain> [label]      save the running brain (RAM included)
+#   gbrain-branch log     <brain>                 checkpoints of a brain, newest first
+#   gbrain-branch rewind  <brain> <label>         put the brain back to a checkpoint
+#   gbrain-branch list    <brain>                 branches of a brain
+#
+# Every merge checkpoints the brain first (label before-merge-<branch>), and a
+# rewind checkpoints it first too (before-rewind-<time>), so both can be undone.
+#
+# The brain's markdown repo lives at $GBRAIN_REPO (default /brain) in the VM.
+set -euo pipefail
+
+SMOLVM=${SMOLVM:-$(command -v smolvm || echo "$HOME/.smolvm/smolvm")}
+REPO=${GBRAIN_REPO:-/brain}
+STATE=${GBRAIN_BRANCH_STATE:-$HOME/.gbrain-branch}
+mkdir -p "$STATE"
+
+die() { echo "gbrain-branch: $*" >&2; exit 1; }
+vm() { local m=$1; shift; "$SMOLVM" machine exec --name "$m" -- bash -c "cd $REPO && $*"; }
+parent_of() { cat "$STATE/$1.parent" 2>/dev/null || die "$1 is not a branch made by gbrain-branch"; }
+base_of() { cat "$STATE/$1.base"; }
+# Index only the pages that changed between two commits of a machine's repo
+# (added, modified, renamed and deleted), then wire their [[links]] into the
+# graph. Re-importing the whole repo would re-read every page on each write.
+reindex() {
+  local machine=$1 from=$2 to=$3
+  vm "$machine" "set -e
+    stage=\$(mktemp -d)
+    git diff --name-only --diff-filter=AMR $from $to -- '*.md' | while read -r f; do
+      mkdir -p \"\$stage/\$(dirname \"\$f\")\" && cp \"\$f\" \"\$stage/\$f\"
+    done
+    if [ -n \"\$(ls -A \"\$stage\")\" ]; then gbrain import \"\$stage\" --no-embed >/dev/null 2>&1; fi
+    git diff --name-only --diff-filter=D $from $to -- '*.md' | while read -r f; do
+      gbrain delete \"\${f%.md}\" --force >/dev/null 2>&1 || true
+    done
+    rm -rf \"\$stage\"
+    gbrain extract links --source db >/dev/null 2>&1"
+}
+
+ckpt_dir() { echo "$STATE/checkpoints/$1"; }
+
+# Save the running brain, RAM included, into its deduplicating store, and note
+# what it held so `log` can say what a rewind would restore.
+checkpoint() {
+  local brain=$1 label=$2 dir
+  [[ $label =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid checkpoint label: $label"
+  dir=$(ckpt_dir "$brain")
+  mkdir -p "$dir/store"
+  [[ -e $dir/store/$label.smolcheckpoint ]] && die "$brain already has a checkpoint named $label"
+  "$SMOLVM" machine checkpoint -n "$brain" --store "$dir/store" \
+    -o "$dir/store/$label.smolcheckpoint" >/dev/null 2>&1 \
+    || die "could not checkpoint $brain"
+  printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+    "$(vm "$brain" 'git log --oneline -1')" \
+    "pages: $(vm "$brain" 'gbrain list 2>/dev/null | wc -l')" > "$dir/$label.meta"
+  echo "checkpointed $brain as $label"
+}
+
+cmd=${1:-help}; shift || true
+case $cmd in
+  init)
+    brain=${1:?usage: gbrain-branch init <brain>}
+    "$SMOLVM" machine create --name "$brain" --image oven/bun:1 --net --cpus 4 --mem 4096 \
+      --storage 10 ${GBRAIN_BRANCH_CREATE_FLAGS:-} -- sleep infinity >/dev/null
+    "$SMOLVM" machine start --name "$brain" --branchable >/dev/null
+    "$SMOLVM" machine exec --name "$brain" -- bash -c "
+      set -e
+      apt-get update -qq && apt-get install -y -qq git ca-certificates >/dev/null 2>&1
+      bun install -g github:garrytan/gbrain >/dev/null 2>&1
+      mkdir -p $REPO && cd $REPO && git init -q -b main
+      git config user.email brain@smol.local && git config user.name brain
+      git commit -q --allow-empty -m 'brain'
+      gbrain init --pglite --no-embedding >/dev/null 2>&1"
+    echo "brain '$brain' ready: $(vm "$brain" 'gbrain --version')"
+    ;;
+
+  fork)
+    brain=${1:?usage: gbrain-branch fork <brain> <branch>...}; shift
+    [[ $# -gt 0 ]] || die "name at least one branch"
+    head=$(vm "$brain" 'git rev-parse HEAD')
+    for branch in "$@"; do
+      t0=$(date +%s%N)
+      if ! out=$("$SMOLVM" machine branch --from "$brain" --name "$branch" 2>&1); then
+        reason=$(printf '%s\n' "$out" | grep -m1 -i 'error' || printf '%s\n' "$out" | tail -1)
+        if [[ $reason == *"backing layers"* ]]; then
+          die "$brain has been forked as often as one machine can be (each live fork adds a disk layer, capped at 32). Rebuild it: gbrain-branch init <new-brain>, then import its pages."
+        fi
+        die "could not branch $brain: $reason"
+      fi
+      echo "$brain" > "$STATE/$branch.parent"
+      echo "$head" > "$STATE/$branch.base"
+      echo "forked $branch from $brain in $(( ($(date +%s%N) - t0) / 1000000 )) ms"
+    done
+    ;;
+
+  exec)
+    branch=${1:?usage: gbrain-branch exec <branch> -- <cmd>...}; shift
+    [[ ${1:-} == -- ]] && shift
+    "$SMOLVM" machine exec --name "$branch" -- bash -c "cd $REPO && $(printf '%q ' "$@")"
+    ;;
+
+  write)
+    # Save a page (markdown on stdin) into a brain or branch, commit it, and
+    # re-index so it is searchable and linked at once.
+    target=${1:?usage: gbrain-branch write <brain-or-branch> <slug> < page.md}
+    slug=${2:?usage: gbrain-branch write <brain-or-branch> <slug> < page.md}
+    [[ $slug =~ ^[a-z0-9][a-z0-9/_-]*$ && $slug != *..* ]] || die "invalid slug: $slug"
+    content=$(base64 -w0)
+    vm "$target" "mkdir -p \"\$(dirname '$slug.md')\" && echo '$content' | base64 -d > '$slug.md' && git add -A && git commit -qm 'write $slug' >/dev/null"
+    reindex "$target" HEAD~1 HEAD
+    echo "wrote $slug in $target"
+    ;;
+
+  diff)
+    branch=${1:?usage: gbrain-branch diff <branch>}
+    vm "$branch" "git diff --name-status $(base_of "$branch")..HEAD -- '*.md'"
+    ;;
+
+  merge)
+    branch=${1:?usage: gbrain-branch merge <branch>}
+    brain=$(parent_of "$branch")
+    # Every merge can be undone: `gbrain-branch rewind <brain> before-merge-<branch>`.
+    checkpoint "$brain" "before-merge-$branch-$(date +%s)" >/dev/null
+    bundle=$(mktemp "$STATE/$branch.XXXX.bundle")
+    trap 'rm -f "$bundle"' EXIT
+    vm "$branch" "git bundle create /tmp/gbrain-branch.bundle $(base_of "$branch")..main >/dev/null 2>&1"
+    "$SMOLVM" machine cp "$branch:/tmp/gbrain-branch.bundle" "$bundle" >/dev/null 2>&1
+    "$SMOLVM" machine cp "$bundle" "$brain:/tmp/gbrain-branch.bundle" >/dev/null 2>&1
+    # A real merge: if the brain learned something else meanwhile, git merges
+    # both histories and refuses a conflicting edit rather than picking one.
+    before=$(vm "$brain" "git rev-parse HEAD")
+    if ! vm "$brain" "git pull -q --no-rebase --no-edit /tmp/gbrain-branch.bundle main >/dev/null 2>&1"; then
+      # Leave the brain exactly as it was: no half-merged pages to index.
+      conflicts=$(vm "$brain" "git diff --name-only --diff-filter=U | tr '\n' ' '; git merge --abort 2>/dev/null || true")
+      die "$branch conflicts with $brain in: ${conflicts:-unknown}. Nothing was merged; reconcile those pages in the branch and merge again."
+    fi
+    reindex "$brain" "$before" HEAD
+    echo "merged $branch into $brain: $(vm "$brain" 'git log --oneline -1')"
+    ;;
+
+  discard)
+    [[ $# -gt 0 ]] || die "usage: gbrain-branch discard <branch>..."
+    for branch in "$@"; do
+      "$SMOLVM" machine delete --name "$branch" -f >/dev/null 2>&1 || true
+      rm -f "$STATE/$branch.parent" "$STATE/$branch.base"
+      echo "discarded $branch"
+    done
+    ;;
+
+  checkpoint)
+    brain=${1:?usage: gbrain-branch checkpoint <brain> [label]}
+    checkpoint "$brain" "${2:-manual-$(date +%s)}"
+    ;;
+
+  log)
+    brain=${1:?usage: gbrain-branch log <brain>}
+    dir=$(ckpt_dir "$brain")
+    ls -t "$dir"/*.meta 2>/dev/null | while read -r meta; do
+      printf '%-40s %s\n' "$(basename "$meta" .meta)" "$(tr '\t' ' ' < "$meta")"
+    done
+    ;;
+
+  rewind)
+    brain=${1:?usage: gbrain-branch rewind <brain> <label>}
+    label=${2:?usage: gbrain-branch rewind <brain> <label> (see: gbrain-branch log $brain)}
+    dir=$(ckpt_dir "$brain")
+    target="$dir/store/$label.smolcheckpoint"
+    [[ -e $target ]] || die "$brain has no checkpoint named $label (see: gbrain-branch log $brain)"
+    # Branches carry history the rewound brain may no longer have; settle them first.
+    open=$("$0" list "$brain")
+    [[ -z $open ]] || die "merge or discard $brain's branches before rewinding it: $(echo $open)"
+    # The rewind itself can be undone.
+    checkpoint "$brain" "before-rewind-$(date +%s)"
+    "$SMOLVM" machine delete --name "$brain" -f >/dev/null 2>&1
+    "$SMOLVM" machine create --name "$brain" --from "$target" >/dev/null 2>&1 \
+      || die "could not restore $label; the state before the rewind is saved as the newest checkpoint"
+    "$SMOLVM" machine start --name "$brain" --branchable >/dev/null 2>&1 \
+      || die "restored $label but could not start $brain"
+    echo "rewound $brain to $label: $(vm "$brain" 'git log --oneline -1')"
+    ;;
+
+  list)
+    brain=${1:?usage: gbrain-branch list <brain>}
+    for f in "$STATE"/*.parent; do
+      [[ -e $f ]] || continue
+      [[ $(cat "$f") == "$brain" ]] && basename "$f" .parent
+    done
+    ;;
+
+  *)
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+    ;;
+esac
