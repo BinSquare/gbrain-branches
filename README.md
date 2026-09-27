@@ -106,7 +106,10 @@ The key is used only by the agent on the host. Each branch's VM never sees it.
 
 ## Notes
 
-- Runs on Linux with KVM or on macOS (Apple Silicon), wherever smolmachines runs.
+- Runs on Linux with KVM and on macOS (Apple Silicon), with the system's own bash 3.2
+  and BSD tools. Keep about 5 GB free: each fork and checkpoint writes only what
+  changed, but the first checkpoint of a brain is about 630 MB.
+- `agent.ts` needs [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`).
 - `demo.sh` scripts the explorations so it runs offline; `agent.ts` is the real thing.
 - Each live fork adds a copy-on-write disk layer to the brain machine, and smolmachines
   caps a machine at 32. A `demo.sh` or `agent.ts` run uses three. When the cap is

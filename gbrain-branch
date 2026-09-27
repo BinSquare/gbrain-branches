@@ -31,6 +31,8 @@ STATE=${GBRAIN_BRANCH_STATE:-$HOME/.gbrain-branch}
 mkdir -p "$STATE"
 
 die() { echo "gbrain-branch: $*" >&2; exit 1; }
+# Milliseconds since the epoch; BSD date (macOS) has no %N.
+now_ms() { perl -MTime::HiRes=time -e 'printf("%d\n", time() * 1000)'; }
 vm() { local m=$1; shift; "$SMOLVM" machine exec --name "$m" -- bash -c "cd $REPO && $*"; }
 parent_of() { cat "$STATE/$1.parent" 2>/dev/null || die "$1 is not a branch made by gbrain-branch"; }
 base_of() { cat "$STATE/$1.base"; }
@@ -94,7 +96,7 @@ case $cmd in
     [[ $# -gt 0 ]] || die "name at least one branch"
     head=$(vm "$brain" 'git rev-parse HEAD')
     for branch in "$@"; do
-      t0=$(date +%s%N)
+      t0=$(now_ms)
       if ! out=$("$SMOLVM" machine branch --from "$brain" --name "$branch" 2>&1); then
         reason=$(printf '%s\n' "$out" | grep -m1 -i 'error' || printf '%s\n' "$out" | tail -1)
         if [[ $reason == *"backing layers"* ]]; then
@@ -104,7 +106,7 @@ case $cmd in
       fi
       echo "$brain" > "$STATE/$branch.parent"
       echo "$head" > "$STATE/$branch.base"
-      echo "forked $branch from $brain in $(( ($(date +%s%N) - t0) / 1000000 )) ms"
+      echo "forked $branch from $brain in $(( $(now_ms) - t0 )) ms"
     done
     ;;
 
@@ -120,7 +122,7 @@ case $cmd in
     target=${1:?usage: gbrain-branch write <brain-or-branch> <slug> < page.md}
     slug=${2:?usage: gbrain-branch write <brain-or-branch> <slug> < page.md}
     [[ $slug =~ ^[a-z0-9][a-z0-9/_-]*$ && $slug != *..* ]] || die "invalid slug: $slug"
-    content=$(base64 -w0)
+    content=$(base64 | tr -d '\n')
     vm "$target" "mkdir -p \"\$(dirname '$slug.md')\" && echo '$content' | base64 -d > '$slug.md' && git add -A && git commit -qm 'write $slug' >/dev/null"
     reindex "$target" HEAD~1 HEAD
     echo "wrote $slug in $target"
@@ -136,7 +138,7 @@ case $cmd in
     brain=$(parent_of "$branch")
     # Every merge can be undone: `gbrain-branch rewind <brain> before-merge-<branch>`.
     checkpoint "$brain" "before-merge-$branch-$(date +%s)" >/dev/null
-    bundle=$(mktemp "$STATE/$branch.XXXX.bundle")
+    bundle=$(mktemp "$STATE/$branch.bundle.XXXXXX")
     trap 'rm -f "$bundle"' EXIT
     vm "$branch" "git bundle create /tmp/gbrain-branch.bundle $(base_of "$branch")..main >/dev/null 2>&1"
     "$SMOLVM" machine cp "$branch:/tmp/gbrain-branch.bundle" "$bundle" >/dev/null 2>&1

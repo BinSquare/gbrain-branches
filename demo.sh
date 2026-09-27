@@ -33,13 +33,22 @@ bold "2. Fork the live brain once per option (skill step 2)"
 gbrain-branch fork "$BRAIN" "${OPTIONS[@]/#/$BRAIN-}" | sed 's/^/  /'
 
 bold "3. An agent explores each option inside its own branch (skill step 3)"
-declare -A FINDING SCORE WHY
-FINDING[hn-launch]="Post a Show HN on a weekday morning, hooked on forking a live VM in under a second. Front page means about 300 signups; missing it means about 20."
-SCORE[hn-launch]=6; WHY[hn-launch]="high variance, one shot"
-FINDING[hackathon-demo]="Demo branching agent memory live at the YC hackathon. Two hundred builders who ship agents see it today and can install it on their laptops on the spot."
-SCORE[hackathon-demo]=9; WHY[hackathon-demo]="the audience is the customer, same day"
-FINDING[twitter-thread]="A thread with a 20-second clip of 50 forks booting. Reach hinges on one repost from a large account."
-SCORE[twitter-thread]=5; WHY[twitter-thread]="depends on luck"
+# What each branch's scripted agent concludes (bash 3.2 has no associative arrays).
+finding() {
+  case $1 in
+    hn-launch) echo "Post a Show HN on a weekday morning, hooked on forking a live VM in under a second. Front page means about 300 signups; missing it means about 20." ;;
+    hackathon-demo) echo "Demo branching agent memory live at the YC hackathon. Two hundred builders who ship agents see it today and can install it on their laptops on the spot." ;;
+    twitter-thread) echo "A thread with a 20-second clip of 50 forks booting. Reach hinges on one repost from a large account." ;;
+  esac
+}
+score() { case $1 in hn-launch) echo 6 ;; hackathon-demo) echo 9 ;; twitter-thread) echo 5 ;; esac; }
+why() {
+  case $1 in
+    hn-launch) echo "high variance, one shot" ;;
+    hackathon-demo) echo "the audience is the customer, same day" ;;
+    twitter-thread) echo "depends on luck" ;;
+  esac
+}
 for o in "${OPTIONS[@]}"; do
   (
     gbrain-branch exec "$BRAIN-$o" -- bash -c "gbrain query 'signups goal' --no-expand >/dev/null 2>&1
@@ -47,17 +56,17 @@ cat > analysis/$o.md <<'EOF'
 ---
 title: Option $o
 type: analysis
-score: ${SCORE[$o]}
+score: $(score $o)
 ---
-${FINDING[$o]}
+$(finding $o)
 
-Builds on [[facts/goal]]. Score ${SCORE[$o]}: ${WHY[$o]}.
+Builds on [[facts/goal]]. Score $(score $o): $(why $o).
 EOF
 git add -A && git commit -qm 'explore $o' && gbrain import . --no-embed >/dev/null 2>&1 && gbrain extract links --source db >/dev/null 2>&1"
   ) &
 done
 wait
-for o in "${OPTIONS[@]}"; do say "$BRAIN-$o  wrote analysis/$o.md  (score ${SCORE[$o]}: ${WHY[$o]})"; done
+for o in "${OPTIONS[@]}"; do say "$BRAIN-$o  wrote analysis/$o.md  (score $(score $o): $(why $o))"; done
 
 bold "4. Each branch remembers only its own exploration"
 printf '  %-32s' ""; for o in "${OPTIONS[@]}"; do printf '%-17s' "$o"; done; echo
@@ -73,7 +82,7 @@ bold "5. Compare what each branch learned (skill step 4)"
 winner=""; best=-1
 for o in "${OPTIONS[@]}"; do
   say "$BRAIN-$o: $(gbrain-branch diff "$BRAIN-$o" | tr '\t\n' '  ')"
-  (( SCORE[$o] > best )) && { best=${SCORE[$o]}; winner=$o; }
+  if (( $(score "$o") > best )); then best=$(score "$o"); winner=$o; fi
 done
 say "best supported: $winner (score $best)"
 
